@@ -20,6 +20,8 @@
 * DEALINGS IN THE SOFTWARE.
 */
 
+#include <sstream>
+
 #include "vulkan-backend.h"
 #include <nvrhi/common/misc.h>
 
