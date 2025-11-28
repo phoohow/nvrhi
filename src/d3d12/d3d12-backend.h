@@ -627,6 +627,7 @@ namespace nvrhi::d3d12
     public:
         uint32_t capacity = 0;
         DescriptorIndex firstDescriptor = 0;
+        D3D12_DESCRIPTOR_HEAP_TYPE heapType = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
 
         DescriptorTable(DeviceResources& resources)
             : m_Resources(resources)

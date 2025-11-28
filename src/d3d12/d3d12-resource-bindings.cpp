@@ -363,12 +363,32 @@ namespace nvrhi::d3d12
 
     DescriptorTableHandle Device::createDescriptorTable(IBindingLayout* layout)
     {
-        (void)layout; // not necessary on DX12
-
         DescriptorTable* ret = new DescriptorTable(m_Resources);
         ret->capacity = 0;
         ret->firstDescriptor = 0;
-        
+
+        // If a bindless layout is provided, check whether it contains sampler register spaces
+        // and mark the descriptor table to use the sampler heap in that case. Otherwise
+        // default to CBV/SRV/UAV heap.
+        if (layout && layout->getBindlessDesc())
+        {
+            const BindlessLayoutDesc* bindless = layout->getBindlessDesc();
+            bool hasSampler = false;
+            for (const BindingLayoutItem& item : bindless->registerSpaces)
+            {
+                if (item.type == ResourceType::Sampler)
+                {
+                    hasSampler = true;
+                    break;
+                }
+            }
+
+            if (hasSampler)
+                ret->heapType = D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER;
+            else
+                ret->heapType = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+        }
+
         return DescriptorTableHandle::Create(ret);
     }
 
@@ -381,7 +401,10 @@ namespace nvrhi::d3d12
 
     DescriptorTable::~DescriptorTable()
     {
-        m_Resources.shaderResourceViewHeap.releaseDescriptors(firstDescriptor, capacity);
+        if (heapType == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER)
+            m_Resources.samplerHeap.releaseDescriptors(firstDescriptor, capacity);
+        else
+            m_Resources.shaderResourceViewHeap.releaseDescriptors(firstDescriptor, capacity);
     }
 
     BindingLayout::BindingLayout(const BindingLayoutDesc& _desc)
@@ -708,7 +731,7 @@ namespace nvrhi::d3d12
                 ss << std::endl << (const char*)errorBlob->GetBufferPointer();
             }
             m_Context.error(ss.str());
-            
+
             return nullptr;
         }
 
@@ -768,7 +791,11 @@ namespace nvrhi::d3d12
         if (binding.slot >= descriptorTable->capacity)
             return false;
 
-        D3D12_CPU_DESCRIPTOR_HANDLE descriptorHandle = m_Resources.shaderResourceViewHeap.getCpuHandle(descriptorTable->firstDescriptor + binding.slot);
+        D3D12_CPU_DESCRIPTOR_HANDLE descriptorHandle = {};
+        if (descriptorTable->heapType == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER)
+            descriptorHandle = m_Resources.samplerHeap.getCpuHandle(descriptorTable->firstDescriptor + binding.slot);
+        else
+            descriptorHandle = m_Resources.shaderResourceViewHeap.getCpuHandle(descriptorTable->firstDescriptor + binding.slot);
 
         switch (binding.type)
         {
@@ -815,11 +842,16 @@ namespace nvrhi::d3d12
             break;
         }
 
+        case ResourceType::Sampler: {
+            Sampler* sampler = checked_cast<Sampler*>(binding.resourceHandle);
+            sampler->createDescriptor(descriptorHandle.ptr);
+            break;
+        }
+
         case ResourceType::VolatileConstantBuffer:
             m_Context.error("Attempted to bind a volatile constant buffer to a bindless set.");
             return false;
 
-        case ResourceType::Sampler:
         case ResourceType::PushConstants:
         case ResourceType::Count:
         default:
@@ -827,7 +859,10 @@ namespace nvrhi::d3d12
             return false;
         }
 
-        m_Resources.shaderResourceViewHeap.copyToShaderVisibleHeap(descriptorTable->firstDescriptor + binding.slot, 1);
+        if (descriptorTable->heapType == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER)
+            m_Resources.samplerHeap.copyToShaderVisibleHeap(descriptorTable->firstDescriptor + binding.slot, 1);
+        else
+            m_Resources.shaderResourceViewHeap.copyToShaderVisibleHeap(descriptorTable->firstDescriptor + binding.slot, 1);
         return true;
     }
 
@@ -840,7 +875,11 @@ namespace nvrhi::d3d12
 
         if (newSize < descriptorTable->capacity)
         {
-            m_Resources.shaderResourceViewHeap.releaseDescriptors(descriptorTable->firstDescriptor + newSize, descriptorTable->capacity - newSize);
+            if (descriptorTable->heapType == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER)
+                m_Resources.samplerHeap.releaseDescriptors(descriptorTable->firstDescriptor + newSize, descriptorTable->capacity - newSize);
+            else
+                m_Resources.shaderResourceViewHeap.releaseDescriptors(descriptorTable->firstDescriptor + newSize, descriptorTable->capacity - newSize);
+
             descriptorTable->capacity = newSize;
             return;
         }
@@ -848,24 +887,44 @@ namespace nvrhi::d3d12
         uint32_t originalFirst = descriptorTable->firstDescriptor;
         if (!keepContents && descriptorTable->capacity > 0)
         {
-            m_Resources.shaderResourceViewHeap.releaseDescriptors(descriptorTable->firstDescriptor, descriptorTable->capacity);
+            if (descriptorTable->heapType == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER)
+                m_Resources.samplerHeap.releaseDescriptors(descriptorTable->firstDescriptor, descriptorTable->capacity);
+            else
+                m_Resources.shaderResourceViewHeap.releaseDescriptors(descriptorTable->firstDescriptor, descriptorTable->capacity);
         }
 
-        descriptorTable->firstDescriptor = m_Resources.shaderResourceViewHeap.allocateDescriptors(newSize);
+        if (descriptorTable->heapType == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER)
+            descriptorTable->firstDescriptor = m_Resources.samplerHeap.allocateDescriptors(newSize);
+        else
+            descriptorTable->firstDescriptor = m_Resources.shaderResourceViewHeap.allocateDescriptors(newSize);
 
         if (keepContents && descriptorTable->capacity > 0)
         {
-            m_Context.device->CopyDescriptorsSimple(descriptorTable->capacity,
-                m_Resources.shaderResourceViewHeap.getCpuHandle(descriptorTable->firstDescriptor),
-                m_Resources.shaderResourceViewHeap.getCpuHandle(originalFirst),
-                D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+            D3D12_DESCRIPTOR_HEAP_TYPE heapType = descriptorTable->heapType == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER ? D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER : D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
 
             m_Context.device->CopyDescriptorsSimple(descriptorTable->capacity,
-                m_Resources.shaderResourceViewHeap.getCpuHandleShaderVisible(descriptorTable->firstDescriptor),
-                m_Resources.shaderResourceViewHeap.getCpuHandle(originalFirst),
-                D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+                (descriptorTable->heapType == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER) ? m_Resources.samplerHeap.getCpuHandle(descriptorTable->firstDescriptor) : m_Resources.shaderResourceViewHeap.getCpuHandle(descriptorTable->firstDescriptor),
+                (descriptorTable->heapType == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER) ? m_Resources.samplerHeap.getCpuHandle(originalFirst) : m_Resources.shaderResourceViewHeap.getCpuHandle(originalFirst),
+                heapType);
 
-            m_Resources.shaderResourceViewHeap.releaseDescriptors(originalFirst, descriptorTable->capacity);
+            if (descriptorTable->heapType == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER)
+            {
+                m_Context.device->CopyDescriptorsSimple(descriptorTable->capacity,
+                    m_Resources.samplerHeap.getCpuHandleShaderVisible(descriptorTable->firstDescriptor),
+                    m_Resources.samplerHeap.getCpuHandle(originalFirst),
+                    D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER);
+
+                m_Resources.samplerHeap.releaseDescriptors(originalFirst, descriptorTable->capacity);
+            }
+            else
+            {
+                m_Context.device->CopyDescriptorsSimple(descriptorTable->capacity,
+                    m_Resources.shaderResourceViewHeap.getCpuHandleShaderVisible(descriptorTable->firstDescriptor),
+                    m_Resources.shaderResourceViewHeap.getCpuHandle(originalFirst),
+                    D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+
+                m_Resources.shaderResourceViewHeap.releaseDescriptors(originalFirst, descriptorTable->capacity);
+            }
         }
 
         descriptorTable->capacity = newSize;
@@ -972,8 +1031,10 @@ namespace nvrhi::d3d12
                 else
                 {
                     DescriptorTable* descriptorTable = checked_cast<DescriptorTable*>(_bindingSet);
-
-                    m_ActiveCommandList->commandList->SetComputeRootDescriptorTable(rootParameterOffset, m_Resources.shaderResourceViewHeap.getGpuHandle(descriptorTable->firstDescriptor));
+                    if (descriptorTable->heapType == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER)
+                        m_ActiveCommandList->commandList->SetComputeRootDescriptorTable(rootParameterOffset, m_Resources.samplerHeap.getGpuHandle(descriptorTable->firstDescriptor));
+                    else
+                        m_ActiveCommandList->commandList->SetComputeRootDescriptorTable(rootParameterOffset, m_Resources.shaderResourceViewHeap.getGpuHandle(descriptorTable->firstDescriptor));
                 }
             }
 
@@ -1099,7 +1160,10 @@ namespace nvrhi::d3d12
                 {
                     DescriptorTable* descriptorTable = checked_cast<DescriptorTable*>(_bindingSet);
 
-                    m_ActiveCommandList->commandList->SetGraphicsRootDescriptorTable(rootParameterOffset, m_Resources.shaderResourceViewHeap.getGpuHandle(descriptorTable->firstDescriptor));
+                    if (descriptorTable->heapType == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER)
+                        m_ActiveCommandList->commandList->SetGraphicsRootDescriptorTable(rootParameterOffset, m_Resources.samplerHeap.getGpuHandle(descriptorTable->firstDescriptor));
+                    else
+                        m_ActiveCommandList->commandList->SetGraphicsRootDescriptorTable(rootParameterOffset, m_Resources.shaderResourceViewHeap.getGpuHandle(descriptorTable->firstDescriptor));
                 }
             }
 
